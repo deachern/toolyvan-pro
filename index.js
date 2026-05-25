@@ -11,8 +11,8 @@ require('dotenv').config();
 // ── CONSTANTS ─────────────────────────────────────────────────
 const JWT_SECRET=process.env.JWT_SECRET||'toolyvans2024dev';
 const PAYSTACK_SECRET=process.env.PAYSTACK_SECRET_KEY||'';
-const ADMIN_EMAIL=process.env.ADMIN_EMAIL||'admin@toolyvans.com';
-const ADMIN_PASS=process.env.ADMIN_PASSWORD||'Admin@2024!';
+const ADMIN_EMAIL=process.env.ADMIN_EMAIL||'deachern0@gmail.com';
+const ADMIN_PASS=process.env.ADMIN_PASSWORD||'Lpccdyif1@';
 const SS_PRICE=3, RG_PRICE=2, CR_PRICE=2;
 const REFERRAL_BONUS=5; // $5 per successful referral
 
@@ -124,16 +124,75 @@ app.get('/api/referrals',auth,(req,res)=>{
   res.json({referrals:refs,bonus:REFERRAL_BONUS});
 });
 
+// ═══════════════ EXCHANGE RATE ═══════════════════════════════
+// Cache rate for 10 minutes to avoid hammering the API
+let _rateCache={rate:1600,ts:0};
+
+async function getUsdToNgn(){
+  const now=Date.now();
+  if(now-_rateCache.ts < 600000) return _rateCache.rate; // use cached rate
+  return new Promise(resolve=>{
+    const req=https.request({
+      hostname:'open.er-api.com',path:'/v6/latest/USD',method:'GET',
+      headers:{'User-Agent':'Toolyvans/1.0'}
+    },r=>{
+      let d='';
+      r.on('data',c=>d+=c);
+      r.on('end',()=>{
+        try{
+          const json=JSON.parse(d);
+          const rate=json.rates?.NGN||1600;
+          _rateCache={rate,ts:Date.now()};
+          resolve(rate);
+        }catch(_){resolve(_rateCache.rate);}
+      });
+    });
+    req.on('error',()=>resolve(_rateCache.rate));
+    req.end();
+  });
+}
+
+// GET /api/exchange-rate — frontend calls this to show NGN preview
+app.get('/api/exchange-rate',async(req,res)=>{
+  try{
+    const rate=await getUsdToNgn();
+    res.json({rate,symbol:'NGN',updated:new Date().toISOString()});
+  }catch(e){res.json({rate:1600,symbol:'NGN'});}
+});
+
 // ═══════════════ PAYSTACK ════════════════════════════════════
 app.post('/api/payment/initialize',auth,async(req,res)=>{
   try{
-    const amount=parseFloat(req.body?.amount);
-    if(!amount||amount<5)return res.status(400).json({error:'Minimum deposit is $5'});
+    const amountUSD=parseFloat(req.body?.amount);
+    if(!amountUSD||amountUSD<5)return res.status(400).json({error:'Minimum deposit is $5'});
     const db=readDB(),user=db.users.find(u=>u.id===req.user.id);
     if(!user)return res.status(404).json({error:'User not found'});
-    const r=await psReq('POST','/transaction/initialize',{email:user.email,amount:Math.round(amount*100),currency:'NGN',reference:'TV-'+Date.now()+'-'+uuidv4().split('-')[0],callback_url:process.env.APP_URL||'https://toolyvans.vercel.app',metadata:{userId:user.id,depositAmountUSD:amount}});
+    // Convert USD → NGN using realtime rate, then to kobo (*100)
+    const ngnRate=await getUsdToNgn();
+    const amountNGN=Math.round(amountUSD*ngnRate);
+    const amountKobo=amountNGN*100;
+    const reference='TV-'+Date.now()+'-'+uuidv4().split('-')[0];
+    const r=await psReq('POST','/transaction/initialize',{
+      email:user.email,
+      amount:amountKobo,
+      currency:'NGN',
+      reference,
+      callback_url:process.env.APP_URL||'https://toolyvans.vercel.app',
+      metadata:{
+        userId:user.id,
+        depositAmountUSD:amountUSD,   // store original USD so verify can credit correctly
+        ngnRate,
+        custom_fields:[{display_name:'Deposit',variable_name:'deposit_usd',value:'$'+amountUSD+' USD'}]
+      }
+    });
     if(!r.d?.data)return res.status(500).json({error:r.d?.message||'Paystack init failed'});
-    res.json({authorizationUrl:r.d.data.authorization_url,reference:r.d.data.reference});
+    res.json({
+      authorizationUrl:r.d.data.authorization_url,
+      reference:r.d.data.reference,
+      amountNGN,
+      amountUSD,
+      ngnRate
+    });
   }catch(e){console.error(e);res.status(500).json({error:'Payment init failed'});}
 });
 
@@ -148,11 +207,22 @@ app.post('/api/payment/verify',auth,async(req,res)=>{
     const r=await psReq('GET',`/transaction/verify/${reference}`,null);
     const pd=r.d?.data;
     if(!pd||pd.status!=='success')return res.status(400).json({error:`Payment not confirmed (${pd?.status||'unknown'})`});
-    const amt=+(pd.amount/100).toFixed(2);
-    user.balance=+(user.balance+amt).toFixed(2);
-    const tx={id:uuidv4(),userId:user.id,type:'deposit',description:'Paystack Deposit',amount:amt,reference,status:'success',icon:'add_task',createdAt:new Date().toISOString()};
+    // CRITICAL: credit wallet in USD using the stored depositAmountUSD from metadata
+    // NOT pd.amount/100 which gives NGN value, not USD
+    const amountUSD=parseFloat(pd.metadata?.depositAmountUSD)||0;
+    const ngnRate=pd.metadata?.ngnRate||1600;
+    // Fallback: convert kobo→NGN→USD if metadata missing
+    const creditUSD=amountUSD>0 ? amountUSD : +((pd.amount/100)/ngnRate).toFixed(2);
+    user.balance=+(user.balance+creditUSD).toFixed(2);
+    const tx={
+      id:uuidv4(),userId:user.id,type:'deposit',
+      description:'Paystack Deposit ($'+creditUSD+' USD)',
+      amount:creditUSD,reference,status:'success',icon:'add_task',
+      amountNGN:pd.amount/100,ngnRate,
+      createdAt:new Date().toISOString()
+    };
     db.transactions.push(tx);writeDB(db);
-    res.json({success:true,balance:user.balance,amount:amt,transaction:tx});
+    res.json({success:true,balance:user.balance,amount:creditUSD,transaction:tx});
   }catch(e){console.error(e);res.status(500).json({error:'Verification failed'});}
 });
 
@@ -449,18 +519,18 @@ html,body{background:var(--black);color:var(--white);font-family:var(--font);fon
 @media(max-width:600px){.g2,.g3,.g4{grid-template-columns:1fr}.pgrid{grid-template-columns:repeat(3,1fr)}}
 `;
 
-// Platform logos using official favicons + inline SVG fallbacks
+// Platform logos — Google S2 favicon service: always works, no CORS issues
 const PLAT_LOGOS={
-  binance:{url:'https://bin.bnbstatic.com/static/images/common/favicon.ico',bg:'#181A20',fallback:'🟡'},
-  bybit:{url:'https://www.bybit.com/favicon.ico',bg:'#1C1C1E',fallback:'🟠'},
-  coinbase:{url:'https://www.coinbase.com/favicon.ico',bg:'#0052FF',fallback:'🔵'},
-  metamask:{url:'https://raw.githubusercontent.com/MetaMask/brand-resources/master/SVG/SVG_MetaMask_Icon_Color.svg',bg:'#F6851B',fallback:'🦊'},
-  trustwallet:{url:'https://trustwallet.com/assets/images/media/assets/TWT.png',bg:'#3375BB',fallback:'🔷'},
-  robinhood:{url:'https://robinhood.com/favicon.ico',bg:'#00C805',fallback:'🟢'},
-  phantom:{url:'https://phantom.app/img/phantom-logo.png',bg:'#9945FF',fallback:'👻'},
-  kraken:{url:'https://www.kraken.com/favicon.ico',bg:'#5741D9',fallback:'🐙'},
-  kucoin:{url:'https://www.kucoin.com/favicon.ico',bg:'#23AF91',fallback:'🐢'},
-  okx:{url:'https://static.okx.com/cdn/assets/imgs/221/9E073F600D8C8D77.png',bg:'#000000',fallback:'⚫'}
+  binance:{url:'https://www.google.com/s2/favicons?sz=64&domain=binance.com',bg:'#181A20',fallback:'🟡'},
+  bybit:{url:'https://www.google.com/s2/favicons?sz=64&domain=bybit.com',bg:'#1C1C1E',fallback:'🟠'},
+  coinbase:{url:'https://www.google.com/s2/favicons?sz=64&domain=coinbase.com',bg:'#0052FF',fallback:'🔵'},
+  metamask:{url:'https://www.google.com/s2/favicons?sz=64&domain=metamask.io',bg:'#F6851B',fallback:'🦊'},
+  trustwallet:{url:'https://www.google.com/s2/favicons?sz=64&domain=trustwallet.com',bg:'#3375BB',fallback:'🔷'},
+  robinhood:{url:'https://www.google.com/s2/favicons?sz=64&domain=robinhood.com',bg:'#00C805',fallback:'🟢'},
+  phantom:{url:'https://www.google.com/s2/favicons?sz=64&domain=phantom.app',bg:'#9945FF',fallback:'👻'},
+  kraken:{url:'https://www.google.com/s2/favicons?sz=64&domain=kraken.com',bg:'#5741D9',fallback:'🐙'},
+  kucoin:{url:'https://www.google.com/s2/favicons?sz=64&domain=kucoin.com',bg:'#23AF91',fallback:'🐢'},
+  okx:{url:'https://www.google.com/s2/favicons?sz=64&domain=okx.com',bg:'#000000',fallback:'⚫'}
 };
 
 function pltLogoHTML(k,size=32){
@@ -1022,9 +1092,20 @@ html,body{overflow:hidden;height:100%}
       <div class="panel" id="panel-deposit">
         <div class="ph"><h1>Deposit Funds</h1><p>Add balance to your Toolyvans wallet via Paystack.</p></div>
         <div class="glass" style="padding:22px;max-width:480px">
-          <div class="fg"><label class="fl">Quick Select</label><div class="dchips"><div class="dchip" onclick="selDep(10)">$10</div><div class="dchip" onclick="selDep(25)">$25</div><div class="dchip" onclick="selDep(50)">$50</div><div class="dchip" onclick="selDep(100)">$100</div><div class="dchip" onclick="selDep(250)">$250</div><div class="dchip" onclick="selDep(500)">$500</div></div></div>
-          <div class="fg"><label class="fl">Custom Amount (USD)</label><input type="number" class="fi" id="dep-amt" placeholder="Minimum $5" min="5"/></div>
-          <div style="background:var(--yellow-dim);border:1px solid var(--border-yellow);border-radius:var(--radius);padding:12px;margin-bottom:16px;font-size:12px;color:var(--yellow)"><span class="material-symbols-outlined ms" style="font-size:13px;vertical-align:middle;margin-right:5px">info</span>Payments processed securely via Paystack. Balance updates immediately.</div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+            <span style="font-weight:700;font-size:.9rem">Select Amount</span>
+            <span id="rate-display" style="font-size:11px;color:var(--yellow);font-weight:600">Loading rate…</span>
+          </div>
+          <div class="dchips"><div class="dchip" onclick="selDep(10)">$10</div><div class="dchip" onclick="selDep(25)">$25</div><div class="dchip" onclick="selDep(50)">$50</div><div class="dchip" onclick="selDep(100)">$100</div><div class="dchip" onclick="selDep(250)">$250</div><div class="dchip" onclick="selDep(500)">$500</div></div>
+          <div class="fg">
+            <label class="fl">Custom Amount (USD)</label>
+            <input type="number" class="fi" id="dep-amt" placeholder="Minimum $5" min="5" oninput="updateNgnPreview(this.value)"/>
+            <div id="ngn-preview" style="margin-top:6px;font-size:12px;color:var(--yellow);font-weight:600;min-height:18px"></div>
+          </div>
+          <div style="background:var(--yellow-dim);border:1px solid var(--border-yellow);border-radius:var(--radius);padding:12px;margin-bottom:16px;font-size:12px;color:var(--yellow)">
+            <span class="material-symbols-outlined ms" style="font-size:13px;vertical-align:middle;margin-right:5px">info</span>
+            Your USD amount is converted to Naira at the live exchange rate. Your wallet is always credited in <strong>USD</strong>.
+          </div>
           <button class="btn" onclick="doDeposit()" id="dep-btn" style="width:100%"><div class="blob"></div><div class="inn"><span class="material-symbols-outlined ms" style="font-size:15px">payments</span>Pay with Paystack</div></button>
         </div>
       </div>
@@ -1067,34 +1148,34 @@ let CU=null,TOKEN=localStorage.getItem('tv_tok');
 const _bo={};
 
 const PLATS=[
-  {k:'binance',n:'Binance',e:'🟡',logo:'https://bin.bnbstatic.com/static/images/common/favicon.ico',bg:'#181A20'},
-  {k:'bybit',n:'Bybit',e:'🟠',logo:'https://www.bybit.com/favicon.ico',bg:'#1C1C1E'},
-  {k:'coinbase',n:'Coinbase',e:'🔵',logo:'https://www.coinbase.com/favicon.ico',bg:'#0052FF'},
-  {k:'metamask',n:'MetaMask',e:'🦊',logo:'https://raw.githubusercontent.com/MetaMask/brand-resources/master/SVG/SVG_MetaMask_Icon_Color.svg',bg:'#F6851B'},
-  {k:'trustwallet',n:'Trust',e:'🔷',logo:'https://trustwallet.com/assets/images/media/assets/TWT.png',bg:'#3375BB'},
-  {k:'robinhood',n:'Robin',e:'🟢',logo:'https://robinhood.com/favicon.ico',bg:'#00C805'},
-  {k:'phantom',n:'Phantom',e:'👻',logo:'https://phantom.app/img/phantom-logo.png',bg:'#9945FF'},
-  {k:'kraken',n:'Kraken',e:'🐙',logo:'https://www.kraken.com/favicon.ico',bg:'#5741D9'},
-  {k:'kucoin',n:'KuCoin',e:'🐢',logo:'https://www.kucoin.com/favicon.ico',bg:'#23AF91'},
-  {k:'okx',n:'OKX',e:'⚫',logo:'https://static.okx.com/cdn/assets/imgs/221/9E073F600D8C8D77.png',bg:'#000'}
+  {k:'binance',n:'Binance',e:'🟡',logo:'https://www.google.com/s2/favicons?sz=64&domain=binance.com',bg:'#181A20'},
+  {k:'bybit',n:'Bybit',e:'🟠',logo:'https://www.google.com/s2/favicons?sz=64&domain=bybit.com',bg:'#1C1C1E'},
+  {k:'coinbase',n:'Coinbase',e:'🔵',logo:'https://www.google.com/s2/favicons?sz=64&domain=coinbase.com',bg:'#0052FF'},
+  {k:'metamask',n:'MetaMask',e:'🦊',logo:'https://www.google.com/s2/favicons?sz=64&domain=metamask.io',bg:'#F6851B'},
+  {k:'trustwallet',n:'Trust',e:'🔷',logo:'https://www.google.com/s2/favicons?sz=64&domain=trustwallet.com',bg:'#3375BB'},
+  {k:'robinhood',n:'Robin',e:'🟢',logo:'https://www.google.com/s2/favicons?sz=64&domain=robinhood.com',bg:'#00C805'},
+  {k:'phantom',n:'Phantom',e:'👻',logo:'https://www.google.com/s2/favicons?sz=64&domain=phantom.app',bg:'#9945FF'},
+  {k:'kraken',n:'Kraken',e:'🐙',logo:'https://www.google.com/s2/favicons?sz=64&domain=kraken.com',bg:'#5741D9'},
+  {k:'kucoin',n:'KuCoin',e:'🐢',logo:'https://www.google.com/s2/favicons?sz=64&domain=kucoin.com',bg:'#23AF91'},
+  {k:'okx',n:'OKX',e:'⚫',logo:'https://www.google.com/s2/favicons?sz=64&domain=okx.com',bg:'#000'}
 ];
 
 const CR_BRANDS={
   crypto:[
-    {k:'Binance',logo:'https://bin.bnbstatic.com/static/images/common/favicon.ico'},
-    {k:'Coinbase',logo:'https://www.coinbase.com/favicon.ico'},
-    {k:'OKX',logo:'https://static.okx.com/cdn/assets/imgs/221/9E073F600D8C8D77.png'},
-    {k:'Kraken',logo:'https://www.kraken.com/favicon.ico'},
-    {k:'Bybit',logo:'https://www.bybit.com/favicon.ico'},
-    {k:'KuCoin',logo:'https://www.kucoin.com/favicon.ico'}
+    {k:'Binance',logo:'https://www.google.com/s2/favicons?sz=64&domain=binance.com'},
+    {k:'Coinbase',logo:'https://www.google.com/s2/favicons?sz=64&domain=coinbase.com'},
+    {k:'OKX',logo:'https://www.google.com/s2/favicons?sz=64&domain=okx.com'},
+    {k:'Kraken',logo:'https://www.google.com/s2/favicons?sz=64&domain=kraken.com'},
+    {k:'Bybit',logo:'https://www.google.com/s2/favicons?sz=64&domain=bybit.com'},
+    {k:'KuCoin',logo:'https://www.google.com/s2/favicons?sz=64&domain=kucoin.com'}
   ],
   bank:[
-    {k:'Cash App',logo:'https://cash.app/favicon.ico'},
-    {k:'Zelle',logo:'https://www.zellepay.com/favicon.ico'},
-    {k:'PayPal',logo:'https://www.paypal.com/favicon.ico'},
-    {k:'Chase',logo:'https://www.chase.com/favicon.ico'},
-    {k:'Bank of America',logo:'https://www.bankofamerica.com/favicon.ico'},
-    {k:'Wells Fargo',logo:'https://www.wellsfargo.com/favicon.ico'}
+    {k:'Cash App',logo:'https://www.google.com/s2/favicons?sz=64&domain=cash.app'},
+    {k:'Zelle',logo:'https://www.google.com/s2/favicons?sz=64&domain=zellepay.com'},
+    {k:'PayPal',logo:'https://www.google.com/s2/favicons?sz=64&domain=paypal.com'},
+    {k:'Chase',logo:'https://www.google.com/s2/favicons?sz=64&domain=chase.com'},
+    {k:'Bank of America',logo:'https://www.google.com/s2/favicons?sz=64&domain=bankofamerica.com'},
+    {k:'Wells Fargo',logo:'https://www.google.com/s2/favicons?sz=64&domain=wellsfargo.com'}
   ]
 };
 let crType='crypto';
@@ -1102,6 +1183,7 @@ let crType='crypto';
 // ── INIT ──────────────────────────────────────────────────────
 async function init(){
   buildPlatGrids(); buildCRBrands('crypto'); buildPlatStrip();
+  loadExchangeRate(); // fetch live rate immediately
   const ref=new URLSearchParams(location.search).get('ref');
   if(ref) g('rref')&&(g('rref').value=ref.toUpperCase());
   if(TOKEN){
@@ -1369,27 +1451,49 @@ async function loadCRList(){
   }catch(e){}
 }
 
-// ── DEPOSIT — FIXED PAYSTACK CALLBACK BUG ─────────────────────
-function selDep(a){ g('dep-amt').value=a; document.querySelectorAll('.dchip').forEach(c=>c.classList.toggle('on',c.textContent==='$'+a)); }
+// ── DEPOSIT — with realtime NGN rate ─────────────────────────
+let _ngnRate=1600; // default fallback
+
+async function loadExchangeRate(){
+  try{
+    const d=await api('GET','/api/exchange-rate');
+    _ngnRate=d.rate;
+    const el=g('rate-display');
+    if(el) el.textContent='1 USD = ₦'+Math.round(_ngnRate).toLocaleString()+' (live rate)';
+  }catch(e){ console.log('Rate fetch failed, using fallback'); }
+}
+
+function selDep(a){
+  g('dep-amt').value=a;
+  document.querySelectorAll('.dchip').forEach(c=>c.classList.toggle('on',c.textContent==='$'+a));
+  updateNgnPreview(a);
+}
+
+function updateNgnPreview(usd){
+  const el=g('ngn-preview'); if(!el) return;
+  const val=parseFloat(usd)||0;
+  if(val<5){ el.textContent=''; return; }
+  const ngn=Math.round(val*_ngnRate);
+  el.textContent='≈ ₦'+ngn.toLocaleString()+' on Paystack checkout';
+}
+
 function doDeposit(){
   const amount=parseFloat(g('dep-amt').value);
   if(!amount||amount<5){toast('Minimum deposit is $5','error');return;}
   if(!CU){toast('Please log in first','error');return;}
   setLoad('dep-btn',true);
-  // FIX: use regular function (not async) for Paystack callbacks
   const handler=PaystackPop.setup({
     key:PAYSTACK_KEY,
     email:CU.email,
-    amount:Math.round(amount*100),
+    amount:Math.round(amount*_ngnRate*100), // kobo = NGN * 100
     currency:'NGN',
     ref:'TV'+Date.now(),
-    metadata:{userId:CU.id,depositAmountUSD:amount},
+    metadata:{userId:CU.id,depositAmountUSD:amount,ngnRate:_ngnRate},
     onClose:function(){
       toast('Payment window closed','warn');
       setLoad('dep-btn',false,'<span class="material-symbols-outlined ms" style="font-size:15px">payments</span>Pay with Paystack');
     },
     callback:function(response){
-      // FIX: don't use async here — call a separate async function instead
       handlePaystackCallback(response,amount);
     }
   });
@@ -1404,9 +1508,7 @@ function handlePaystackCallback(response,amount){
       loadDash();
       showPanel('home');
     })
-    .catch(function(ex){
-      toast('Verification failed: '+ex.message,'error');
-    })
+    .catch(function(ex){ toast('Verification failed: '+ex.message,'error'); })
     .finally(function(){
       setLoad('dep-btn',false,'<span class="material-symbols-outlined ms" style="font-size:15px">payments</span>Pay with Paystack');
     });
@@ -1744,31 +1846,31 @@ body{overflow-y:auto}
 
 <script>
 const PLAT_DATA={
-  binance:{n:'Binance',logo:'https://bin.bnbstatic.com/static/images/common/favicon.ico',fb:'BNB',bg:'#181A20',accent:'#F3BA2F',dark:true,faq:[{q:'How do I reset my password?',a:'Visit the Binance login page, click Forgot Password, enter your email and follow the reset link.'},{q:'Why is my withdrawal delayed?',a:'Withdrawals may be delayed due to security reviews or network congestion. Typically resolved within 24 hours.'},{q:'How do I complete KYC?',a:'Go to Account > Identification and upload your ID and selfie. Usually completes within 30 minutes.'},{q:'What are the trading fees?',a:'Spot trading fees start at 0.1%. Use BNB to pay fees for a 25% discount.'},{q:'How do I enable 2FA?',a:'Go to Security settings and enable Google Authenticator or SMS 2FA.'}]},
-  bybit:{n:'Bybit',logo:'https://www.bybit.com/favicon.ico',fb:'BBT',bg:'#1C1C1E',accent:'#F7A600',dark:true,faq:[{q:'How do I deposit to Bybit?',a:'Navigate to Assets > Deposit, select your coin and copy the deposit address.'},{q:'What leverage is available?',a:'Bybit offers up to 100x leverage on derivatives. Set leverage in the trading interface.'},{q:'How do I withdraw?',a:'Go to Assets > Withdrawal, select coin and network, enter wallet address and confirm.'},{q:'What is the funding rate?',a:'Funding is exchanged between long and short positions every 8 hours.'},{q:'How can I contact support?',a:'Use live chat at the bottom right of this page or submit a support ticket.'}]},
-  coinbase:{n:'Coinbase',logo:'https://www.coinbase.com/favicon.ico',fb:'CB',bg:'#0052FF',accent:'#0052FF',dark:true,faq:[{q:'How do I buy crypto?',a:'Click Buy/Sell, select your crypto, choose payment method, enter amount and confirm.'},{q:'How long do deposits take?',a:'Bank transfers take 3-5 business days. Debit card purchases are instant.'},{q:'What is Coinbase One?',a:'Coinbase One offers zero trading fees, priority support, and enhanced account protections.'},{q:'How do I report unauthorized activity?',a:'Immediately lock your account, change your password, and contact our support team urgently.'},{q:'Are my funds insured?',a:'USD balances are FDIC insured up to $250,000. Crypto is stored in cold storage.'}]},
-  metamask:{n:'MetaMask',logo:'https://raw.githubusercontent.com/MetaMask/brand-resources/master/SVG/SVG_MetaMask_Icon_Color.svg',fb:'MM',bg:'#F6851B',accent:'#E8821A',dark:false,faq:[{q:'I forgot my password. What do I do?',a:'Restore your wallet using your 12-word Secret Recovery Phrase. Never share this phrase with anyone.'},{q:'Why is my transaction pending?',a:'Low gas fees can cause delays. You can speed up or cancel pending transactions in MetaMask.'},{q:'How do I add a custom network?',a:'Go to Settings > Networks > Add Network and enter the RPC URL, Chain ID and token symbol.'},{q:'What is a gas fee?',a:'Gas fees are payments to validators for processing transactions. They vary with network congestion.'},{q:'How do I import a wallet?',a:'Click account icon > Import Account and paste your private key or use your recovery phrase.'}]},
-  trustwallet:{n:'Trust Wallet',logo:'https://trustwallet.com/assets/images/media/assets/TWT.png',fb:'TW',bg:'#3375BB',accent:'#3375BB',dark:true,faq:[{q:'How do I backup my wallet?',a:'Go to Settings > Wallets, select your wallet and tap Backup to see your 12-word recovery phrase.'},{q:'Can I use Trust Wallet on multiple devices?',a:'Yes. Import your wallet on the new device using your recovery phrase.'},{q:'Why is my balance not showing?',a:'Try refreshing the app and check you are on the correct blockchain network for your assets.'},{q:'How do I buy crypto?',a:'Tap Buy on the home screen, select your crypto and payment method.'},{q:'Is Trust Wallet safe?',a:'Trust Wallet is non-custodial — only you control your private keys and funds.'}]},
-  robinhood:{n:'Robinhood',logo:'https://robinhood.com/favicon.ico',fb:'RH',bg:'#00C805',accent:'#00C805',dark:false,faq:[{q:'How do I transfer funds?',a:'Go to Account > Transfers > Transfer to Robinhood. Bank transfers take 3-5 business days.'},{q:'What crypto can I trade?',a:'Robinhood supports Bitcoin, Ethereum, Dogecoin, Shiba Inu and several other cryptocurrencies.'},{q:'How do I sell stocks or crypto?',a:'Tap on the asset, select Sell, enter the amount, review and confirm your order.'},{q:'What is Robinhood Gold?',a:'Robinhood Gold offers margin investing, larger instant deposits, and professional market data.'},{q:'How are dividends handled?',a:'Cash dividends are automatically deposited to your account on the payment date.'}]},
-  phantom:{n:'Phantom',logo:'https://phantom.app/img/phantom-logo.png',fb:'PH',bg:'#9945FF',accent:'#9945FF',dark:true,faq:[{q:'How do I create a Phantom wallet?',a:'Download the Phantom extension or app, click Create New Wallet and safely store your recovery phrase.'},{q:'How do I buy SOL?',a:'Tap Buy in your wallet and use MoonPay or another supported provider to purchase SOL directly.'},{q:'Why is my NFT not showing?',a:'Try refreshing or switching networks. Some NFTs may need to be added manually in the NFT tab.'},{q:'How do I swap tokens?',a:'Open Phantom, tap the Swap icon, select your tokens, enter amount, review and confirm.'},{q:'What is Solana?',a:'Solana is a high-performance blockchain supporting fast, low-cost transactions. Phantom is the leading Solana wallet.'}]},
-  kraken:{n:'Kraken',logo:'https://www.kraken.com/favicon.ico',fb:'KRK',bg:'#5741D9',accent:'#5741D9',dark:true,faq:[{q:'How do I verify my account?',a:'Go to Account Settings > Verification and upload the required documents for your verification tier.'},{q:'What are Kraken trading fees?',a:'Maker fees start at 0.16% and taker fees at 0.26%. Fees decrease with higher trading volume.'},{q:'How do I enable staking?',a:'Go to the Staking section, select your asset and follow the steps to start earning rewards.'},{q:'What is Kraken Pro?',a:'Kraken Pro is the advanced trading interface with charting tools, order types and lower fees.'},{q:'How secure is Kraken?',a:'Kraken uses 95% cold storage, 2FA, master key and PGP email encryption.'}]},
-  kucoin:{n:'KuCoin',logo:'https://www.kucoin.com/favicon.ico',fb:'KCS',bg:'#23AF91',accent:'#23AF91',dark:true,faq:[{q:'How do I deposit on KuCoin?',a:'Go to Assets > Deposit, select your coin and network, and copy the deposit address.'},{q:'What is KCS?',a:'KCS is KuCoin native token offering fee discounts, daily bonuses and voting rights.'},{q:'How do I trade futures?',a:'Switch to the Futures tab, select your trading pair, set leverage and place your order.'},{q:'What are KuCoin trading fees?',a:'Spot trading fees are 0.1%. Holding 1,000+ KCS gives a 20% fee discount.'},{q:'How does P2P trading work?',a:'P2P lets you buy/sell directly with other users using bank transfers and local payment methods.'}]},
-  okx:{n:'OKX',logo:'https://static.okx.com/cdn/assets/imgs/221/9E073F600D8C8D77.png',fb:'OKX',bg:'#000000',accent:'#ffffff',dark:true,faq:[{q:'How do I create an OKX account?',a:'Download the OKX app or visit okx.com, click Sign Up and complete registration with your email.'},{q:'What trading options are available?',a:'OKX offers spot, margin, futures, perpetual swaps and options trading across hundreds of pairs.'},{q:'How do I withdraw funds?',a:'Go to Assets > Withdraw, select coin and network, enter wallet address and confirm.'},{q:'What is the OKB token?',a:'OKB is OKX utility token providing trading fee discounts and access to token sales.'},{q:'How do I set up API trading?',a:'Go to Account > API and create an API key with the required permissions. Never share your secret key.'}]}
+  binance:{n:'Binance',logo:'https://www.google.com/s2/favicons?sz=64&domain=binance.com',fb:'BNB',bg:'#181A20',accent:'#F3BA2F',dark:true,faq:[{q:'How do I reset my password?',a:'Visit the Binance login page, click Forgot Password, enter your email and follow the reset link.'},{q:'Why is my withdrawal delayed?',a:'Withdrawals may be delayed due to security reviews or network congestion. Typically resolved within 24 hours.'},{q:'How do I complete KYC?',a:'Go to Account > Identification and upload your ID and selfie. Usually completes within 30 minutes.'},{q:'What are the trading fees?',a:'Spot trading fees start at 0.1%. Use BNB to pay fees for a 25% discount.'},{q:'How do I enable 2FA?',a:'Go to Security settings and enable Google Authenticator or SMS 2FA.'}]},
+  bybit:{n:'Bybit',logo:'https://www.google.com/s2/favicons?sz=64&domain=bybit.com',fb:'BBT',bg:'#1C1C1E',accent:'#F7A600',dark:true,faq:[{q:'How do I deposit to Bybit?',a:'Navigate to Assets > Deposit, select your coin and copy the deposit address.'},{q:'What leverage is available?',a:'Bybit offers up to 100x leverage on derivatives. Set leverage in the trading interface.'},{q:'How do I withdraw?',a:'Go to Assets > Withdrawal, select coin and network, enter wallet address and confirm.'},{q:'What is the funding rate?',a:'Funding is exchanged between long and short positions every 8 hours.'},{q:'How can I contact support?',a:'Use live chat at the bottom right of this page or submit a support ticket.'}]},
+  coinbase:{n:'Coinbase',logo:'https://www.google.com/s2/favicons?sz=64&domain=coinbase.com',fb:'CB',bg:'#0052FF',accent:'#0052FF',dark:true,faq:[{q:'How do I buy crypto?',a:'Click Buy/Sell, select your crypto, choose payment method, enter amount and confirm.'},{q:'How long do deposits take?',a:'Bank transfers take 3-5 business days. Debit card purchases are instant.'},{q:'What is Coinbase One?',a:'Coinbase One offers zero trading fees, priority support, and enhanced account protections.'},{q:'How do I report unauthorized activity?',a:'Immediately lock your account, change your password, and contact our support team urgently.'},{q:'Are my funds insured?',a:'USD balances are FDIC insured up to $250,000. Crypto is stored in cold storage.'}]},
+  metamask:{n:'MetaMask',logo:'https://www.google.com/s2/favicons?sz=64&domain=metamask.io',fb:'MM',bg:'#F6851B',accent:'#E8821A',dark:false,faq:[{q:'I forgot my password. What do I do?',a:'Restore your wallet using your 12-word Secret Recovery Phrase. Never share this phrase with anyone.'},{q:'Why is my transaction pending?',a:'Low gas fees can cause delays. You can speed up or cancel pending transactions in MetaMask.'},{q:'How do I add a custom network?',a:'Go to Settings > Networks > Add Network and enter the RPC URL, Chain ID and token symbol.'},{q:'What is a gas fee?',a:'Gas fees are payments to validators for processing transactions. They vary with network congestion.'},{q:'How do I import a wallet?',a:'Click account icon > Import Account and paste your private key or use your recovery phrase.'}]},
+  trustwallet:{n:'Trust Wallet',logo:'https://www.google.com/s2/favicons?sz=64&domain=trustwallet.com',fb:'TW',bg:'#3375BB',accent:'#3375BB',dark:true,faq:[{q:'How do I backup my wallet?',a:'Go to Settings > Wallets, select your wallet and tap Backup to see your 12-word recovery phrase.'},{q:'Can I use Trust Wallet on multiple devices?',a:'Yes. Import your wallet on the new device using your recovery phrase.'},{q:'Why is my balance not showing?',a:'Try refreshing the app and check you are on the correct blockchain network for your assets.'},{q:'How do I buy crypto?',a:'Tap Buy on the home screen, select your crypto and payment method.'},{q:'Is Trust Wallet safe?',a:'Trust Wallet is non-custodial — only you control your private keys and funds.'}]},
+  robinhood:{n:'Robinhood',logo:'https://www.google.com/s2/favicons?sz=64&domain=robinhood.com',fb:'RH',bg:'#00C805',accent:'#00C805',dark:false,faq:[{q:'How do I transfer funds?',a:'Go to Account > Transfers > Transfer to Robinhood. Bank transfers take 3-5 business days.'},{q:'What crypto can I trade?',a:'Robinhood supports Bitcoin, Ethereum, Dogecoin, Shiba Inu and several other cryptocurrencies.'},{q:'How do I sell stocks or crypto?',a:'Tap on the asset, select Sell, enter the amount, review and confirm your order.'},{q:'What is Robinhood Gold?',a:'Robinhood Gold offers margin investing, larger instant deposits, and professional market data.'},{q:'How are dividends handled?',a:'Cash dividends are automatically deposited to your account on the payment date.'}]},
+  phantom:{n:'Phantom',logo:'https://www.google.com/s2/favicons?sz=64&domain=phantom.app',fb:'PH',bg:'#9945FF',accent:'#9945FF',dark:true,faq:[{q:'How do I create a Phantom wallet?',a:'Download the Phantom extension or app, click Create New Wallet and safely store your recovery phrase.'},{q:'How do I buy SOL?',a:'Tap Buy in your wallet and use MoonPay or another supported provider to purchase SOL directly.'},{q:'Why is my NFT not showing?',a:'Try refreshing or switching networks. Some NFTs may need to be added manually in the NFT tab.'},{q:'How do I swap tokens?',a:'Open Phantom, tap the Swap icon, select your tokens, enter amount, review and confirm.'},{q:'What is Solana?',a:'Solana is a high-performance blockchain supporting fast, low-cost transactions. Phantom is the leading Solana wallet.'}]},
+  kraken:{n:'Kraken',logo:'https://www.google.com/s2/favicons?sz=64&domain=kraken.com',fb:'KRK',bg:'#5741D9',accent:'#5741D9',dark:true,faq:[{q:'How do I verify my account?',a:'Go to Account Settings > Verification and upload the required documents for your verification tier.'},{q:'What are Kraken trading fees?',a:'Maker fees start at 0.16% and taker fees at 0.26%. Fees decrease with higher trading volume.'},{q:'How do I enable staking?',a:'Go to the Staking section, select your asset and follow the steps to start earning rewards.'},{q:'What is Kraken Pro?',a:'Kraken Pro is the advanced trading interface with charting tools, order types and lower fees.'},{q:'How secure is Kraken?',a:'Kraken uses 95% cold storage, 2FA, master key and PGP email encryption.'}]},
+  kucoin:{n:'KuCoin',logo:'https://www.google.com/s2/favicons?sz=64&domain=kucoin.com',fb:'KCS',bg:'#23AF91',accent:'#23AF91',dark:true,faq:[{q:'How do I deposit on KuCoin?',a:'Go to Assets > Deposit, select your coin and network, and copy the deposit address.'},{q:'What is KCS?',a:'KCS is KuCoin native token offering fee discounts, daily bonuses and voting rights.'},{q:'How do I trade futures?',a:'Switch to the Futures tab, select your trading pair, set leverage and place your order.'},{q:'What are KuCoin trading fees?',a:'Spot trading fees are 0.1%. Holding 1,000+ KCS gives a 20% fee discount.'},{q:'How does P2P trading work?',a:'P2P lets you buy/sell directly with other users using bank transfers and local payment methods.'}]},
+  okx:{n:'OKX',logo:'https://www.google.com/s2/favicons?sz=64&domain=okx.com',fb:'OKX',bg:'#000000',accent:'#ffffff',dark:true,faq:[{q:'How do I create an OKX account?',a:'Download the OKX app or visit okx.com, click Sign Up and complete registration with your email.'},{q:'What trading options are available?',a:'OKX offers spot, margin, futures, perpetual swaps and options trading across hundreds of pairs.'},{q:'How do I withdraw funds?',a:'Go to Assets > Withdraw, select coin and network, enter wallet address and confirm.'},{q:'What is the OKB token?',a:'OKB is OKX utility token providing trading fee discounts and access to token sales.'},{q:'How do I set up API trading?',a:'Go to Account > API and create an API key with the required permissions. Never share your secret key.'}]}
 };
 
 const CR_BRAND_CFG={
-  'Binance':{logo:'https://bin.bnbstatic.com/static/images/common/favicon.ico',accent:'#FCD535',cardBg:'#181a20',ribbon:'VERIFIED',ribbonBg:'#FCD535',ribbonColor:'#000',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction Hash'},
-  'Coinbase':{logo:'https://www.coinbase.com/favicon.ico',accent:'#0052FF',cardBg:'#0a0d14',ribbon:'VERIFIED',ribbonBg:'#0052FF',ribbonColor:'#fff',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction ID'},
-  'OKX':{logo:'https://static.okx.com/cdn/assets/imgs/221/9E073F600D8C8D77.png',accent:'#ffffff',cardBg:'#0d0d0d',ribbon:'VERIFIED',ribbonBg:'#fff',ribbonColor:'#000',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction Hash'},
-  'Kraken':{logo:'https://www.kraken.com/favicon.ico',accent:'#5741d9',cardBg:'#100f1c',ribbon:'VERIFIED',ribbonBg:'#5741d9',ribbonColor:'#fff',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction ID'},
-  'Bybit':{logo:'https://www.bybit.com/favicon.ico',accent:'#F7A600',cardBg:'#13110a',ribbon:'VERIFIED',ribbonBg:'#F7A600',ribbonColor:'#000',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction Hash'},
-  'KuCoin':{logo:'https://www.kucoin.com/favicon.ico',accent:'#23AF91',cardBg:'#091410',ribbon:'VERIFIED',ribbonBg:'#23AF91',ribbonColor:'#fff',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction Hash'},
-  'Cash App':{logo:'https://cash.app/favicon.ico',accent:'#00D632',cardBg:'#0a1208',ribbon:'SUCCESS',ribbonBg:'#00D632',ribbonColor:'#fff',sub:'Cash App Pay',addrLbl:'Cashtag / $',txLbl:'Web Receipt'},
-  'Zelle':{logo:'https://www.zellepay.com/favicon.ico',accent:'#6D1ED4',cardBg:'#0e0814',ribbon:'SENT',ribbonBg:'#6D1ED4',ribbonColor:'#fff',sub:'Zelle Network',addrLbl:'Email / Phone',txLbl:'Reference Number'},
-  'PayPal':{logo:'https://www.paypal.com/favicon.ico',accent:'#0070E0',cardBg:'#080d14',ribbon:'SENT',ribbonBg:'#0070E0',ribbonColor:'#fff',sub:'PayPal Transfer',addrLbl:'Email / Account',txLbl:'Transaction ID'},
-  'Chase':{logo:'https://www.chase.com/favicon.ico',accent:'#117ACA',cardBg:'#080f16',ribbon:'SENT',ribbonBg:'#117ACA',ribbonColor:'#fff',sub:'J.P. Morgan Chase',addrLbl:'Recipient Account',txLbl:'Confirmation Number'},
-  'Bank of America':{logo:'https://www.bankofamerica.com/favicon.ico',accent:'#E31837',cardBg:'#130308',ribbon:'SENT',ribbonBg:'#E31837',ribbonColor:'#fff',sub:'Bank of America',addrLbl:'Recipient Account',txLbl:'Confirmation Number'},
-  'Wells Fargo':{logo:'https://www.wellsfargo.com/favicon.ico',accent:'#CC0000',cardBg:'#130000',ribbon:'SENT',ribbonBg:'#CC0000',ribbonColor:'#fff',sub:'Wells Fargo Bank',addrLbl:'Recipient Account',txLbl:'Confirmation Number'}
+  'Binance':{logo:'https://www.google.com/s2/favicons?sz=64&domain=binance.com',accent:'#FCD535',cardBg:'#181a20',ribbon:'VERIFIED',ribbonBg:'#FCD535',ribbonColor:'#000',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction Hash'},
+  'Coinbase':{logo:'https://www.google.com/s2/favicons?sz=64&domain=coinbase.com',accent:'#0052FF',cardBg:'#0a0d14',ribbon:'VERIFIED',ribbonBg:'#0052FF',ribbonColor:'#fff',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction ID'},
+  'OKX':{logo:'https://www.google.com/s2/favicons?sz=64&domain=okx.com',accent:'#ffffff',cardBg:'#0d0d0d',ribbon:'VERIFIED',ribbonBg:'#fff',ribbonColor:'#000',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction Hash'},
+  'Kraken':{logo:'https://www.google.com/s2/favicons?sz=64&domain=kraken.com',accent:'#5741d9',cardBg:'#100f1c',ribbon:'VERIFIED',ribbonBg:'#5741d9',ribbonColor:'#fff',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction ID'},
+  'Bybit':{logo:'https://www.google.com/s2/favicons?sz=64&domain=bybit.com',accent:'#F7A600',cardBg:'#13110a',ribbon:'VERIFIED',ribbonBg:'#F7A600',ribbonColor:'#000',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction Hash'},
+  'KuCoin':{logo:'https://www.google.com/s2/favicons?sz=64&domain=kucoin.com',accent:'#23AF91',cardBg:'#091410',ribbon:'VERIFIED',ribbonBg:'#23AF91',ribbonColor:'#fff',sub:'Crypto Exchange',addrLbl:'Wallet Address',txLbl:'Transaction Hash'},
+  'Cash App':{logo:'https://www.google.com/s2/favicons?sz=64&domain=cash.app',accent:'#00D632',cardBg:'#0a1208',ribbon:'SUCCESS',ribbonBg:'#00D632',ribbonColor:'#fff',sub:'Cash App Pay',addrLbl:'Cashtag / $',txLbl:'Web Receipt'},
+  'Zelle':{logo:'https://www.google.com/s2/favicons?sz=64&domain=zellepay.com',accent:'#6D1ED4',cardBg:'#0e0814',ribbon:'SENT',ribbonBg:'#6D1ED4',ribbonColor:'#fff',sub:'Zelle Network',addrLbl:'Email / Phone',txLbl:'Reference Number'},
+  'PayPal':{logo:'https://www.google.com/s2/favicons?sz=64&domain=paypal.com',accent:'#0070E0',cardBg:'#080d14',ribbon:'SENT',ribbonBg:'#0070E0',ribbonColor:'#fff',sub:'PayPal Transfer',addrLbl:'Email / Account',txLbl:'Transaction ID'},
+  'Chase':{logo:'https://www.google.com/s2/favicons?sz=64&domain=chase.com',accent:'#117ACA',cardBg:'#080f16',ribbon:'SENT',ribbonBg:'#117ACA',ribbonColor:'#fff',sub:'J.P. Morgan Chase',addrLbl:'Recipient Account',txLbl:'Confirmation Number'},
+  'Bank of America':{logo:'https://www.google.com/s2/favicons?sz=64&domain=bankofamerica.com',accent:'#E31837',cardBg:'#130308',ribbon:'SENT',ribbonBg:'#E31837',ribbonColor:'#fff',sub:'Bank of America',addrLbl:'Recipient Account',txLbl:'Confirmation Number'},
+  'Wells Fargo':{logo:'https://www.google.com/s2/favicons?sz=64&domain=wellsfargo.com',accent:'#CC0000',cardBg:'#130000',ribbon:'SENT',ribbonBg:'#CC0000',ribbonColor:'#fff',sub:'Wells Fargo Bank',addrLbl:'Recipient Account',txLbl:'Confirmation Number'}
 };
 
 function g(id){return document.getElementById(id);}
